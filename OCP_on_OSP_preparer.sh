@@ -226,7 +226,7 @@ neutron security-group-rule-create appnode-sg \
 --protocol udp --port-range-min 4789 --port-range-max 4789
 fi
 
-##### Nodes booted from volumes
+##### Nodes booted from volumes (Rafal)
 
 function waitFor () {
   i=1
@@ -245,7 +245,7 @@ function waitFor () {
 
 read -p "Do you want to create Boot-from-Volume nodes? (y/n) " answerBFV
 
-if [ "$answerBFV" = "y"]; then
+if [ "$answerBFV" = "y" ]; then
   source ./keystonerc_openshift
   # Create a volume from provided image
   openstack volume create --size 10 --image "${RHEL_IMAGE_NAME}" --description "${RHEL_IMAGE_NAME} based volume for OCP BFV" "${RHEL_IMAGE_NAME}-volume"
@@ -258,157 +258,155 @@ if [ "$answerBFV" = "y"]; then
   # Create volumes from snapshot created in the previous step
   for HOST in ${OCP_ALLNODES}
   do
-    openstack volume create --size 30 --snapshot ${RHEL_IMAGE_NAME}-volume-snapshot ${HOST}-volume
+    openstack volume create --size 30 --snapshot "${RHEL_IMAGE_NAME}-volume-snapshot" "${HOST}-volume"
   done
 
   NETWORKID=$(openstack network show openshift-network -f value -c id)
 
   echo -e "\n##### Creating bastion instance\n"
+  waitFor "openstack volume show \"${OCP_BASTION}-volume\" -f value -c status" "available" 3 10
   openstack server create \
     --volume ${OCP_BASTION}-volume \
     --flavor ocpbastion \
     --key-name ${KEYPAIR_NAME} \
     --nic net-id=${NETWORKID} \
-    --security-groups bastion-sh \
+    --security-group bastion-sg \
     --user-data ./cloudinit/${OCP_BASTION}.yaml \
     ${OCP_BASTION}.${OCP_DOMAIN}
  
   echo -e "\n##### Creating load balancers\n"
   for HOST in $OCP_LB
   do
+    waitFor "openstack volume show \"${HOST}-volume\" -f value -c status" "available" 3 10
     openstack server create \
       --volume ${HOST}-volume \
       --flavor ocplb \
       --key-name ${KEYPAIR_NAME} \
       --nic net-id=${NETWORKID} \
-      --security-groups lb-sg \
+      --security-group lb-sg \
       --user-data ./cloudinit/${HOST}.yaml \
       ${HOST}.${OCP_DOMAIN}
-    $HOST.$OCP_DOMAIN
   done
 
   echo -e "\n##### Creating master nodes instance(s)\n"
   for HOST in $OCP_MASTERS
   do
-    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
-    if [ "$VOLUMEID" != "" ]
-    then
-      openstack server create \
-        --volume ${HOST}-volume \
-        --flavor ocpmaster \
-        --key-name ${KEYPAIR_NAME} \
-        --nic net-id=${NETWORKID} \
-        --security-groups master-sg \
-        --user-data ./cloudinit/${HOST}.yaml \
-        --block-device-mapping vdb=${VOLUMEID} \
-        ${HOST}.${OCP_DOMAIN}
-    else
-      openstack server create \
-        --volume ${HOST}-volume \
-        --flavor ocpmaster \
-        --key-name ${KEYPAIR_NAME} \
-        --nic net-id=${NETWORKID} \
-        --security-groups master-sg \
-        --user-data ./cloudinit/${HOST}.yaml \
-        ${HOST}.${OCP_DOMAIN}
-    fi
+    waitFor "openstack volume show \"${HOST}-volume\" -f value -c status" "available" 3 10
+    openstack server create \
+      --volume ${HOST}-volume \
+      --flavor ocpmaster \
+      --key-name ${KEYPAIR_NAME} \
+      --nic net-id=${NETWORKID} \
+      --security-group master-sg \
+      --user-data ./cloudinit/${HOST}.yaml \
+      ${HOST}.${OCP_DOMAIN}
   done
 
   echo -e "\n##### Creating infra nodes instance(s)\n"
   for HOST in ${OCP_INFRANODES}
   do
-    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
+    waitFor "openstack volume show \"${HOST}-volume\" -f value -c status" "available" 3 10
     openstack server create \
       --volume ${HOST}-volume \
       --flavor ocpinfranode \
       --key-name ${KEYPAIR_NAME} \
       --nic net-id=${NETWORKID} \
-      --security-groups infranode-sg \
+      --security-group infranode-sg \
       --user-data ./cloudinit/${HOST}.yaml \
-      --block-device-mapping vdb=${VOLUMEID} \
       ${HOST}.${OCP_DOMAIN}
   done
 
   echo -e "\n##### Creating app nodes instance(s)\n"
   for HOST in $OCP_APPNODES
   do 
-    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
+    waitFor "openstack volume show \"${HOST}-volume\" -f value -c status" "available" 3 10
     openstack server create \
       --volume ${HOST}-volume \
       --flavor ocpappnode \
       --key-name ${KEYPAIR_NAME} \
       --nic net-id=${NETWORKID} \
-      --security-groups appnode-sg \
+      --security-group appnode-sg \
       --user-data ./cloudinit/${HOST}.yaml \
-      --block-device-mapping vdb=${VOLUMEID} \
       ${HOST}.${OCP_DOMAIN}
   done
+  for HOST in ${OCP_MASTERS} ${OCP_INFRANODES} ${OCP_APPNODES}
+  do
+    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
+    if [ -n "${VOLUMEID}" ]
+    then
+      echo -e "\n#### Attaching volume ${HOST}-docker to ${HOST}.${OCP_DOMAIN}\n"
+      waitFor "openstack server show \"${HOST}.${OCP_DOMAIN}\" -f value -c status" "ACTIVE" 6 5
+      openstack server add volume --device /dev/vdb "${HOST}.${OCP_DOMAIN}" ${VOLUMEID} 
+    fi
+  done
 fi
+
 
 
 ##### OpenShift instances creation
-if [ "$answerBFV" = "n"]; then
-read -p "Do you wish to create the OpenShift nodes? (y/n) " answer
-if [ "$answer" = "y" ]; then
-  source ./keystonerc_openshift
-  echo -e "\n##### Creating bastion instance\n"
-  NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
-  nova boot --flavor ocpbastion --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
-  --nic net-id=$NETWORKID \
-  --security-groups bastion-sg \
-  --user-data ./cloudinit/$OCP_BASTION.yaml \
-  $OCP_BASTION.$OCP_DOMAIN
-  echo -e "\n##### Creating load balancers\n"
-  for HOST in $OCP_LB ; do
+##### If we created BFV nodes there is no need to create them again... (Rafal)
+if [ "$answerBFV" = "n" ]; then
+  read -p "Do you wish to create the OpenShift nodes? (y/n) " answer
+  if [ "$answer" = "y" ]; then
+    source ./keystonerc_openshift
+    echo -e "\n##### Creating bastion instance\n"
     NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
-    nova boot --flavor ocplb --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
+    nova boot --flavor ocpbastion --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
     --nic net-id=$NETWORKID \
-    --security-groups lb-sg \
-    --user-data ./cloudinit/$HOST.yaml \
-    $HOST.$OCP_DOMAIN
-  done
-  echo -e "\n##### Creating master nodes instance(s)\n"
-  for HOST in $OCP_MASTERS ; do
-    NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
-    VOLUMEID=$(cinder show ${HOST}-docker | grep ' id ' | awk '{print $4}')
-    if [ "$VOLUMEID" != "" ]; then  
-      nova boot --flavor ocpmaster --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
-        --nic net-id=$NETWORKID \
-        --security-groups master-sg \
-        --block-device source=volume,dest=volume,device=vdb,id=${VOLUMEID} \
-        --user-data ./cloudinit/$HOST.yaml \
-        $HOST.$OCP_DOMAIN
-    else
-      nova boot --flavor ocpmaster --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
+    --security-groups bastion-sg \
+    --user-data ./cloudinit/$OCP_BASTION.yaml \
+    $OCP_BASTION.$OCP_DOMAIN
+    echo -e "\n##### Creating load balancers\n"
+    for HOST in $OCP_LB ; do
+      NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
+      nova boot --flavor ocplb --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
       --nic net-id=$NETWORKID \
-      --security-groups master-sg \
+      --security-groups lb-sg \
       --user-data ./cloudinit/$HOST.yaml \
       $HOST.$OCP_DOMAIN
-    fi  
-  done
-  echo -e "\n##### Creating infra nodes instance(s)\n"
-  for HOST in $OCP_INFRANODES ; do
-    NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
-    VOLUMEID=$(cinder show ${HOST}-docker | grep ' id ' | awk '{print $4}')
-    nova boot --flavor ocpinfranode --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
-    --nic net-id=$NETWORKID \
-    --security-groups infranode-sg \
-    --block-device source=volume,dest=volume,device=vdb,id=${VOLUMEID} \
-    --user-data ./cloudinit/$HOST.yaml \
-    $HOST.$OCP_DOMAIN
-  done
-  echo -e "\n##### Creating app nodes instance(s)\n"
-  for HOST in $OCP_APPNODES ; do
-    NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
-    VOLUMEID=$(cinder show ${HOST}-docker | grep ' id ' | awk '{print $4}')
-    nova boot --flavor ocpappnode --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
-    --nic net-id=$NETWORKID \
-    --security-groups appnode-sg \
-    --block-device source=volume,dest=volume,device=vdb,id=${VOLUMEID} \
-    --user-data ./cloudinit/$HOST.yaml \
-    $HOST.$OCP_DOMAIN
-  done
-fi
+    done
+    echo -e "\n##### Creating master nodes instance(s)\n"
+    for HOST in $OCP_MASTERS ; do
+      NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
+      VOLUMEID=$(cinder show ${HOST}-docker | grep ' id ' | awk '{print $4}')
+      if [ "$VOLUMEID" != "" ]; then  
+        nova boot --flavor ocpmaster --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
+          --nic net-id=$NETWORKID \
+          --security-groups master-sg \
+          --block-device source=volume,dest=volume,device=vdb,id=${VOLUMEID} \
+          --user-data ./cloudinit/$HOST.yaml \
+          $HOST.$OCP_DOMAIN
+      else
+        nova boot --flavor ocpmaster --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
+        --nic net-id=$NETWORKID \
+        --security-groups master-sg \
+        --user-data ./cloudinit/$HOST.yaml \
+        $HOST.$OCP_DOMAIN
+      fi  
+    done
+    echo -e "\n##### Creating infra nodes instance(s)\n"
+    for HOST in $OCP_INFRANODES ; do
+      NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
+      VOLUMEID=$(cinder show ${HOST}-docker | grep ' id ' | awk '{print $4}')
+      nova boot --flavor ocpinfranode --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
+      --nic net-id=$NETWORKID \
+      --security-groups infranode-sg \
+      --block-device source=volume,dest=volume,device=vdb,id=${VOLUMEID} \
+      --user-data ./cloudinit/$HOST.yaml \
+      $HOST.$OCP_DOMAIN
+    done
+    echo -e "\n##### Creating app nodes instance(s)\n"
+    for HOST in $OCP_APPNODES ; do
+      NETWORKID=$(neutron net-show openshift-network | grep ' id ' | awk '{print $4}')
+      VOLUMEID=$(cinder show ${HOST}-docker | grep ' id ' | awk '{print $4}')
+      nova boot --flavor ocpappnode --image $RHEL_IMAGE_NAME --key-name $KEYPAIR_NAME \
+      --nic net-id=$NETWORKID \
+      --security-groups appnode-sg \
+      --block-device source=volume,dest=volume,device=vdb,id=${VOLUMEID} \
+      --user-data ./cloudinit/$HOST.yaml \
+      $HOST.$OCP_DOMAIN
+    done
+  fi
 fi
 
 ##### Floating IPs creation
