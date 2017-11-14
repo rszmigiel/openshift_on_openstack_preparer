@@ -226,7 +226,128 @@ neutron security-group-rule-create appnode-sg \
 --protocol udp --port-range-min 4789 --port-range-max 4789
 fi
 
+##### Nodes booted from volumes
+
+function waitFor () {
+  i=1
+  while [ $(eval $1) != "$2" ]
+  do
+    echo "[$i/$3] Waiting $4 seconds for: $1 == $2 ..."
+    i=$(( $i + 1 ))
+    sleep ${4}
+    if [ ${i} -gt $3 ]
+    then
+      echo "Reached wait limit, exit 1"
+      exit 1
+    fi
+  done
+}
+
+read -p "Do you want to create Boot-from-Volume nodes? (y/n) " answerBFV
+
+if [ "$answerBFV" = "y"]; then
+  source ./keystonerc_openshift
+  # Create a volume from provided image
+  openstack volume create --size 10 --image "${RHEL_IMAGE_NAME}" --description "${RHEL_IMAGE_NAME} based volume for OCP BFV" "${RHEL_IMAGE_NAME}-volume"
+  # Wait till volume become available
+  waitFor "openstack volume show \"${RHEL_IMAGE_NAME}-volume\" -f value -c status" "available" 6 10
+  # Create a snapshot from volume created in the previous step
+  openstack snapshot create --name "${RHEL_IMAGE_NAME}-volume-snapshot" --description "${RHEL_IMAGE_NAME}-volume snapshot" "${RHEL_IMAGE_NAME}-volume"
+  # Wait till volume snapshot become available
+  waitFor "openstack snapshot show \"${RHEL_IMAGE_NAME}-volume-snapshot\" -f value -c status" "available" 3 10
+  # Create volumes from snapshot created in the previous step
+  for HOST in ${OCP_ALLNODES}
+  do
+    openstack volume create --size 30 --snapshot ${RHEL_IMAGE_NAME}-volume-snapshot ${HOST}-volume
+  done
+
+  NETWORKID=$(openstack network show openshift-network -f value -c id)
+
+  echo -e "\n##### Creating bastion instance\n"
+  openstack server create \
+    --volume ${OCP_BASTION}-volume \
+    --flavor ocpbastion \
+    --key-name ${KEYPAIR_NAME} \
+    --nic net-id=${NETWORKID} \
+    --security-groups bastion-sh \
+    --user-data ./cloudinit/${OCP_BASTION}.yaml \
+    ${OCP_BASTION}.${OCP_DOMAIN}
+ 
+  echo -e "\n##### Creating load balancers\n"
+  for HOST in $OCP_LB
+  do
+    openstack server create \
+      --volume ${HOST}-volume \
+      --flavor ocplb \
+      --key-name ${KEYPAIR_NAME} \
+      --nic net-id=${NETWORKID} \
+      --security-groups lb-sg \
+      --user-data ./cloudinit/${HOST}.yaml \
+      ${HOST}.${OCP_DOMAIN}
+    $HOST.$OCP_DOMAIN
+  done
+
+  echo -e "\n##### Creating master nodes instance(s)\n"
+  for HOST in $OCP_MASTERS
+  do
+    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
+    if [ "$VOLUMEID" != "" ]
+    then
+      openstack server create \
+        --volume ${HOST}-volume \
+        --flavor ocpmaster \
+        --key-name ${KEYPAIR_NAME} \
+        --nic net-id=${NETWORKID} \
+        --security-groups master-sg \
+        --user-data ./cloudinit/${HOST}.yaml \
+        --block-device-mapping vdb=${VOLUMEID} \
+        ${HOST}.${OCP_DOMAIN}
+    else
+      openstack server create \
+        --volume ${HOST}-volume \
+        --flavor ocpmaster \
+        --key-name ${KEYPAIR_NAME} \
+        --nic net-id=${NETWORKID} \
+        --security-groups master-sg \
+        --user-data ./cloudinit/${HOST}.yaml \
+        ${HOST}.${OCP_DOMAIN}
+    fi
+  done
+
+  echo -e "\n##### Creating infra nodes instance(s)\n"
+  for HOST in ${OCP_INFRANODES}
+  do
+    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
+    openstack server create \
+      --volume ${HOST}-volume \
+      --flavor ocpinfranode \
+      --key-name ${KEYPAIR_NAME} \
+      --nic net-id=${NETWORKID} \
+      --security-groups infranode-sg \
+      --user-data ./cloudinit/${HOST}.yaml \
+      --block-device-mapping vdb=${VOLUMEID} \
+      ${HOST}.${OCP_DOMAIN}
+  done
+
+  echo -e "\n##### Creating app nodes instance(s)\n"
+  for HOST in $OCP_APPNODES
+  do 
+    VOLUMEID=$(openstack volume show ${HOST}-docker -f value -c id)
+    openstack server create \
+      --volume ${HOST}-volume \
+      --flavor ocpappnode \
+      --key-name ${KEYPAIR_NAME} \
+      --nic net-id=${NETWORKID} \
+      --security-groups appnode-sg \
+      --user-data ./cloudinit/${HOST}.yaml \
+      --block-device-mapping vdb=${VOLUMEID} \
+      ${HOST}.${OCP_DOMAIN}
+  done
+fi
+
+
 ##### OpenShift instances creation
+if [ "$answerBFV" = "n"]; then
 read -p "Do you wish to create the OpenShift nodes? (y/n) " answer
 if [ "$answer" = "y" ]; then
   source ./keystonerc_openshift
@@ -287,6 +408,7 @@ if [ "$answer" = "y" ]; then
     --user-data ./cloudinit/$HOST.yaml \
     $HOST.$OCP_DOMAIN
   done
+fi
 fi
 
 ##### Floating IPs creation
